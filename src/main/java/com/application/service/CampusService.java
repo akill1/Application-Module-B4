@@ -498,8 +498,155 @@ public class CampusService {
         boolean isRecipientChanging = !java.util.Objects.equals(oldEmpId, newEmpId)
                 || !java.util.Objects.equals(oldProId, newProId);
         
-        // VALIDATION: Cannot update to same campus + same PRO
-        // Only allow update if campus is different OR PRO is different
+        // 3a. CHECK FOR TAKE-BACK SCENARIO
+        // Take-back happens in two cases:
+        // 1. If new receiver matches the original issuer (existingDistribution.getCreated_by())
+        // 2. If new receiver matches the current holder AND same campus - return to original creator
+        Integer originalIssuerId = existingDistribution.getCreated_by();
+        boolean isTakeBackToCreator = (newEmpId != null && newEmpId == originalIssuerId) || 
+                                      (newProId != null && newProId == originalIssuerId);
+        boolean isSameReceiverUpdate = (newCampusId != null && oldCampusId != null && 
+                                        newCampusId.equals(oldCampusId) &&
+                                        java.util.Objects.equals(oldEmpId, newEmpId) &&
+                                        java.util.Objects.equals(oldProId, newProId));
+        boolean isTakeBack = isTakeBackToCreator || isSameReceiverUpdate;
+        
+        if (isTakeBack) {
+            System.out.println("=== TAKE-BACK SCENARIO DETECTED - CampusService ===");
+            if (isTakeBackToCreator) {
+                System.out.println("Type: TAKE-BACK TO ORIGINAL CREATOR");
+                System.out.println("Original Issuer (taking back to): " + originalIssuerId);
+            } else if (isSameReceiverUpdate) {
+                System.out.println("Type: SAME RECEIVER UPDATE - RETURNING TO ORIGINAL CREATOR");
+                System.out.println("Current Holder EmpId: " + oldEmpId + ", ProId: " + oldProId);
+                System.out.println("Same Campus: " + oldCampusId);
+                System.out.println("Returning to Original Creator: " + originalIssuerId);
+            }
+            System.out.println("Current Holder (giving back from) - EmpId: " + oldEmpId + ", ProId: " + oldProId);
+            System.out.println("Range: " + existingDistribution.getAppStartNo() + " - " + existingDistribution.getAppEndNo());
+            System.out.println("Amount: " + originalAmount);
+            
+            // Validate: Only the original issuer can take back (for direct take-back)
+            if (isTakeBackToCreator && dgmUserId != originalIssuerId) {
+                throw new RuntimeException("Take-back denied: Only the original issuer can take back applications. " +
+                        "Original issuer ID: " + originalIssuerId + ", Current user ID: " + dgmUserId);
+            }
+            
+            // Validate: Check if range is valid (should not exceed what was originally distributed)
+            int requestedStart = Integer.parseInt(formDto.getApplicationNoFrom());
+            int requestedEnd = Integer.parseInt(formDto.getApplicationNoTo());
+            int existingStart = (int) existingDistribution.getAppStartNo();
+            int existingEnd = (int) existingDistribution.getAppEndNo();
+            
+            if (requestedStart < existingStart || requestedEnd > existingEnd) {
+                throw new RuntimeException("Take-back range invalid: Requested range (" + requestedStart + "-" + requestedEnd + 
+                        ") exceeds original distribution range (" + existingStart + "-" + existingEnd + ")");
+            }
+            
+            // TAKE-BACK LOGIC: Inactivate the distribution and return apps to original issuer
+            System.out.println("=== DISTRIBUTION TAKE-BACK (INACTIVATE) - CampusService ===");
+            System.out.println("Operation: INACTIVATE DISTRIBUTION (TAKE-BACK)");
+            System.out.println("Distribution ID: " + existingDistribution.getAppDistributionId());
+            System.out.println("Range: " + existingDistribution.getAppStartNo() + " - " + existingDistribution.getAppEndNo());
+            System.out.println("Returning to Original Issuer ID: " + originalIssuerId);
+            existingDistribution.setIsActive(0);
+            existingDistribution.setIssueDate(LocalDateTime.now());
+            distributionRepository.saveAndFlush(existingDistribution);
+            System.out.println("=====================================================");
+            
+            // Handle partial take-back: If range is reduced, create remainder for the portion not taken back
+            int oldStart = (int) existingDistribution.getAppStartNo();
+            int oldEnd = (int) existingDistribution.getAppEndNo();
+            int newStart = Integer.parseInt(formDto.getApplicationNoFrom());
+            int newEnd = Integer.parseInt(formDto.getApplicationNoTo());
+            boolean isPartialTakeBack = (oldStart != newStart || oldEnd != newEnd);
+            
+            if (isPartialTakeBack) {
+                System.out.println("📊 Partial Take-Back: Creating remainder for untaken portion");
+                System.out.println("  Original Range: " + oldStart + " - " + oldEnd);
+                System.out.println("  Take-Back Range: " + newStart + " - " + newEnd);
+                
+                java.util.List<int[]> remainderRanges = new java.util.ArrayList<>();
+                
+                // Check for portion BEFORE the take-back range
+                if (oldStart < newStart) {
+                    int remainderStart = oldStart;
+                    int remainderEnd = newStart - 1;
+                    remainderRanges.add(new int[]{remainderStart, remainderEnd});
+                    System.out.println("  ✅ Adding remainder (before): " + remainderStart + " - " + remainderEnd);
+                }
+                
+                // Check for portion AFTER the take-back range
+                if (oldEnd > newEnd) {
+                    int remainderStart = newEnd + 1;
+                    int remainderEnd = oldEnd;
+                    remainderRanges.add(new int[]{remainderStart, remainderEnd});
+                    System.out.println("  ✅ Adding remainder (after): " + remainderStart + " - " + remainderEnd);
+                }
+                
+                // Create remainder distribution(s) for the untaken portion
+                if (!remainderRanges.isEmpty()) {
+                    for (int[] range : remainderRanges) {
+                        Distribution remainder = new Distribution();
+                        remainder.setAcademicYear(existingDistribution.getAcademicYear());
+                        remainder.setState(existingDistribution.getState());
+                        remainder.setCity(existingDistribution.getCity());
+                        remainder.setZone(existingDistribution.getZone());
+                        remainder.setDistrict(existingDistribution.getDistrict());
+                        remainder.setCampus(existingDistribution.getCampus());
+                        remainder.setIssuedByType(existingDistribution.getIssuedByType());
+                        remainder.setIssuedToType(existingDistribution.getIssuedToType());
+                        remainder.setCreated_by(existingDistribution.getCreated_by());
+                        remainder.setIssueDate(java.time.LocalDateTime.now());
+                        remainder.setAmount(existingDistribution.getAmount());
+                        remainder.setIssued_to_emp_id(existingDistribution.getIssued_to_emp_id());
+                        remainder.setIssued_to_pro_id(existingDistribution.getIssued_to_pro_id());
+                        remainder.setAppStartNo(range[0]);
+                        remainder.setAppEndNo(range[1]);
+                        remainder.setTotalAppCount(range[1] - range[0] + 1);
+                        remainder.setIsActive(1);
+                        
+                        System.out.println("=== DISTRIBUTION SAVE (REMAINDER FROM TAKE-BACK) - CampusService ===");
+                        System.out.println("Remainder Range: " + remainder.getAppStartNo() + " - " + remainder.getAppEndNo());
+                        System.out.println("Total Count: " + remainder.getTotalAppCount() + " apps");
+                        System.out.println("Receiver EmpId: " + remainder.getIssued_to_emp_id());
+                        System.out.println("Receiver ProId: " + remainder.getIssued_to_pro_id());
+                        distributionRepository.saveAndFlush(remainder);
+                        System.out.println("Remainder Distribution ID: " + remainder.getAppDistributionId());
+                        System.out.println("============================================================");
+                    }
+                }
+            }
+            
+            // Flush distribution changes before balance recalculation
+            distributionRepository.flush();
+            
+            // Recalculate balances for take-back
+            int acYear = existingDistribution.getAcademicYear().getAcdcYearId();
+            
+            // A. Original Issuer (gets apps back) - use their original type
+            int originalIssuerTypeId = existingDistribution.getIssuedByType().getAppIssuedId();
+            System.out.println("DEBUG: Recalculating balance for ORIGINAL ISSUER (receiving back): " + originalIssuerId);
+            recalculateBalanceForEmployee(originalIssuerId, acYear, stateId, originalIssuerTypeId,
+                    dgmUserId, originalAmount);
+            
+            // B. Current Holder (loses apps) - use their current type
+            Integer currentHolderId = oldEmpId != null ? oldEmpId : oldProId;
+            if (currentHolderId != null) {
+                int currentHolderTypeId = existingDistribution.getIssuedToType().getAppIssuedId();
+                System.out.println("DEBUG: Recalculating balance for CURRENT HOLDER (giving back): " + currentHolderId);
+                recalculateBalanceForEmployee(currentHolderId, acYear, stateId, currentHolderTypeId,
+                        dgmUserId, originalAmount);
+            }
+            
+            // Flush balance updates
+            balanceTrackRepository.flush();
+            
+            System.out.println("=== TAKE-BACK COMPLETED - CampusService ===");
+            return; // Exit early - take-back is complete
+        }
+        
+        // VALIDATION: Cannot update to same campus + same PRO (if not take-back)
         if (newCampusId != null && oldCampusId != null && newCampusId.equals(oldCampusId)) {
             // Same campus - check if PRO is also the same
             if (java.util.Objects.equals(oldProId, newProId) && newProId != null) {

@@ -395,17 +395,131 @@ public class ZoneService {
         // Set Fee/Amount
         newDistribution.setAmount(request.getApplication_Amount());
 
-        // Save to DB
-        System.out.println("=== DISTRIBUTION SAVE (NEW) - ZoneService ===");
-        System.out.println("Operation: CREATE NEW DISTRIBUTION");
-        System.out.println("Range: " + newDistribution.getAppStartNo() + " - " + newDistribution.getAppEndNo());
-        System.out.println("Receiver EmpId: " + newDistribution.getIssued_to_emp_id());
-        System.out.println("Receiver ProId: " + newDistribution.getIssued_to_pro_id());
-        System.out.println("Amount: " + newDistribution.getAmount());
-        System.out.println("Created By: " + newDistribution.getCreated_by());
-        Distribution savedDist = distributionRepository.saveAndFlush(newDistribution);
-        System.out.println("Saved Distribution ID: " + savedDist.getAppDistributionId());
+        // CHECK FOR MERGE: If there's an existing distribution for the same receiver with contiguous range
+        // This prevents creating multiple records when they should be merged
+        Distribution savedDist;
+        Integer receiverEmpId = newDistribution.getIssued_to_emp_id();
+        
+        // LOG: Who is posting this new range
+        System.out.println("=== NEW DISTRIBUTION REQUEST - ZoneService ===");
+        System.out.println("POSTED BY (Issuer/Creator): Employee ID " + request.getCreatedBy());
+        System.out.println("NEW RANGE: " + request.getAppStartNo() + " - " + request.getAppEndNo() + " (Count: " + request.getRange() + ")");
+        System.out.println("RECEIVER: Employee ID " + request.getIssuedToEmpId());
+        System.out.println("AMOUNT: " + request.getApplication_Amount());
+        System.out.println("ACADEMIC YEAR: " + request.getAcademicYearId());
+        System.out.println("STATE: " + request.getStateId() + ", ZONE: " + request.getZoneId() + ", CITY: " + request.getCityId());
         System.out.println("=============================================");
+        
+        if (receiverEmpId != null) {
+            // Find existing active distributions for this receiver with same amount, academic year, state, zone, city
+            List<Distribution> existingDists = distributionRepository.findActiveHoldingsForEmp(
+                    receiverEmpId, request.getAcademicYearId());
+            
+            System.out.println("DEBUG: Checking for mergeable distributions...");
+            System.out.println("  Found " + existingDists.size() + " existing active distribution(s) for receiver " + receiverEmpId);
+            
+            // Filter for matching criteria
+            List<Distribution> matchingDists = existingDists.stream()
+                    .filter(d -> {
+                        // Same amount
+                        boolean amountMatches = d.getAmount() != null && 
+                                Math.abs(d.getAmount() - request.getApplication_Amount()) < 0.01;
+                        // Same state
+                        boolean stateMatches = d.getState() != null && 
+                                d.getState().getStateId() == request.getStateId();
+                        // Same zone
+                        boolean zoneMatches = d.getZone() != null && 
+                                d.getZone().getZoneId() == request.getZoneId();
+                        // Same city
+                        boolean cityMatches = d.getCity() != null && 
+                                d.getCity().getCityId() == request.getCityId();
+                        // Same created_by (same issuer)
+                        boolean creatorMatches = d.getCreated_by() == request.getCreatedBy();
+                        
+                        return amountMatches && stateMatches && zoneMatches && cityMatches && creatorMatches;
+                    })
+                    .sorted((d1, d2) -> Long.compare(d1.getAppStartNo(), d2.getAppStartNo()))
+                    .toList();
+            
+            // Check if new range is contiguous with any existing distribution
+            int newStart = request.getAppStartNo();
+            int newEnd = request.getAppEndNo();
+            Distribution mergeableDist = null;
+            
+            for (Distribution existing : matchingDists) {
+                int existingStart = (int) existing.getAppStartNo();
+                int existingEnd = (int) existing.getAppEndNo();
+                
+                // Check if new range is contiguous (starts right after existing ends, or ends right before existing starts)
+                boolean isContiguousAfter = (newStart == existingEnd + 1);
+                boolean isContiguousBefore = (newEnd == existingStart - 1);
+                
+                if (isContiguousAfter || isContiguousBefore) {
+                    mergeableDist = existing;
+                    System.out.println("DEBUG: Found mergeable distribution - ID: " + existing.getAppDistributionId() +
+                            ", Created By: Employee ID " + existing.getCreated_by() +
+                            ", Existing Range: " + existingStart + "-" + existingEnd +
+                            ", New Range (posted by Employee ID " + request.getCreatedBy() + "): " + newStart + "-" + newEnd +
+                            ", Contiguous: " + (isContiguousAfter ? "AFTER" : "BEFORE"));
+                    break;
+                }
+            }
+            
+            if (mergeableDist != null) {
+                // MERGE: Update existing distribution instead of creating new one
+                int existingStart = (int) mergeableDist.getAppStartNo();
+                int existingEnd = (int) mergeableDist.getAppEndNo();
+                // newStart and newEnd already declared above
+                
+                // Calculate merged range
+                int mergedStart = Math.min(existingStart, newStart);
+                int mergedEnd = Math.max(existingEnd, newEnd);
+                int mergedCount = mergedEnd - mergedStart + 1;
+                
+                // Update existing distribution
+                mergeableDist.setAppStartNo(mergedStart);
+                mergeableDist.setAppEndNo(mergedEnd);
+                mergeableDist.setTotalAppCount(mergedCount);
+                mergeableDist.setIssueDate(LocalDateTime.now()); // Update timestamp
+                
+                System.out.println("=== DISTRIBUTION MERGE - ZoneService ===");
+                System.out.println("Operation: MERGE WITH EXISTING DISTRIBUTION");
+                System.out.println("Existing Distribution ID: " + mergeableDist.getAppDistributionId());
+                System.out.println("Existing Range: " + existingStart + " - " + existingEnd + " (Created by Employee ID " + mergeableDist.getCreated_by() + ")");
+                System.out.println("New Range: " + newStart + " - " + newEnd + " (Posted by Employee ID " + request.getCreatedBy() + ")");
+                System.out.println("Merged Range: " + mergedStart + " - " + mergedEnd + " (Count: " + mergedCount + ")");
+                System.out.println("Receiver EmpId: " + mergeableDist.getIssued_to_emp_id());
+                System.out.println("Amount: " + mergeableDist.getAmount());
+                System.out.println("NOTE: Both distributions were created by the same issuer (Employee ID " + request.getCreatedBy() + ")");
+                savedDist = distributionRepository.saveAndFlush(mergeableDist);
+                System.out.println("Merged Distribution ID: " + savedDist.getAppDistributionId());
+                System.out.println("=======================================");
+            } else {
+                // No mergeable distribution found, create new one
+                System.out.println("=== DISTRIBUTION SAVE (NEW) - ZoneService ===");
+                System.out.println("Operation: CREATE NEW DISTRIBUTION");
+                System.out.println("Range: " + newDistribution.getAppStartNo() + " - " + newDistribution.getAppEndNo() + " (Count: " + request.getRange() + ")");
+                System.out.println("POSTED BY: Employee ID " + newDistribution.getCreated_by() + " (Issuer/Creator)");
+                System.out.println("Receiver EmpId: " + newDistribution.getIssued_to_emp_id());
+                System.out.println("Receiver ProId: " + newDistribution.getIssued_to_pro_id());
+                System.out.println("Amount: " + newDistribution.getAmount());
+                savedDist = distributionRepository.saveAndFlush(newDistribution);
+                System.out.println("Saved Distribution ID: " + savedDist.getAppDistributionId());
+                System.out.println("=============================================");
+            }
+        } else {
+            // PRO receiver (campus) - create new distribution (no merge logic for PRO yet)
+            System.out.println("=== DISTRIBUTION SAVE (NEW) - ZoneService ===");
+            System.out.println("Operation: CREATE NEW DISTRIBUTION");
+            System.out.println("Range: " + newDistribution.getAppStartNo() + " - " + newDistribution.getAppEndNo());
+            System.out.println("Receiver EmpId: " + newDistribution.getIssued_to_emp_id());
+            System.out.println("Receiver ProId: " + newDistribution.getIssued_to_pro_id());
+            System.out.println("Amount: " + newDistribution.getAmount());
+            System.out.println("Created By: " + newDistribution.getCreated_by());
+            savedDist = distributionRepository.saveAndFlush(newDistribution);
+            System.out.println("Saved Distribution ID: " + savedDist.getAppDistributionId());
+            System.out.println("=============================================");
+        }
 
         // CRITICAL: Flush any pending remainders created in
         // handleOverlappingDistributions
@@ -482,7 +596,165 @@ public class ZoneService {
 
         Float originalAmount = existingDist.getAmount(); // Keep amount!
 
-        // 2. Resolve New Receiver (Zone Service always targets Employee column)
+        // 2. CHECK FOR TAKE-BACK SCENARIO
+        // Take-back happens in two cases:
+        // 1. If issuedToEmpId matches the original issuer (existingDist.getCreated_by())
+        // 2. If issuedToEmpId matches the current holder (same zone, same receiver) - return to original creator
+        Integer originalIssuerId = existingDist.getCreated_by();
+        Integer currentHolderId = existingDist.getIssued_to_emp_id();
+        boolean isTakeBackToCreator = (request.getIssuedToEmpId() == originalIssuerId);
+        boolean isSameReceiverUpdate = (currentHolderId != null && request.getIssuedToEmpId() == currentHolderId);
+        boolean isTakeBack = isTakeBackToCreator || isSameReceiverUpdate;
+        
+        if (isTakeBack) {
+            System.out.println("=== TAKE-BACK SCENARIO DETECTED - ZoneService ===");
+            if (isTakeBackToCreator) {
+                System.out.println("Type: TAKE-BACK TO ORIGINAL CREATOR");
+                System.out.println("Original Issuer (taking back to): " + originalIssuerId);
+            } else if (isSameReceiverUpdate) {
+                System.out.println("Type: SAME RECEIVER UPDATE - RETURNING TO ORIGINAL CREATOR");
+                System.out.println("Current Holder (same as new receiver): " + currentHolderId);
+                System.out.println("Returning to Original Creator: " + originalIssuerId);
+            }
+            System.out.println("Current Holder (giving back from): " + existingDist.getIssued_to_emp_id());
+            System.out.println("Range: " + existingDist.getAppStartNo() + " - " + existingDist.getAppEndNo());
+            System.out.println("Amount: " + originalAmount);
+            
+            // Validate: Only the original issuer can take back (for direct take-back)
+            // For same receiver update, allow if it's the same zone
+            if (isTakeBackToCreator && request.getCreatedBy() != originalIssuerId) {
+                throw new RuntimeException("Take-back denied: Only the original issuer can take back applications. " +
+                        "Original issuer ID: " + originalIssuerId + ", Current user ID: " + request.getCreatedBy());
+            }
+            
+            // For same receiver update, validate it's the same zone
+            if (isSameReceiverUpdate) {
+                // Check if zone matches (same zone update)
+                if (existingDist.getZone() != null && existingDist.getZone().getZoneId() != request.getZoneId()) {
+                    throw new RuntimeException("Same receiver update only allowed within the same zone. " +
+                            "Current zone: " + existingDist.getZone().getZoneId() + ", Requested zone: " + request.getZoneId());
+                }
+                System.out.println("DEBUG: Same receiver update detected - applications will return to original creator " + originalIssuerId);
+            }
+            
+            // Validate: Check if range is valid (should not exceed what was originally distributed)
+            int requestedStart = request.getAppStartNo();
+            int requestedEnd = request.getAppEndNo();
+            int existingStart = (int) existingDist.getAppStartNo();
+            int existingEnd = (int) existingDist.getAppEndNo();
+            
+            if (requestedStart < existingStart || requestedEnd > existingEnd) {
+                throw new RuntimeException("Take-back range invalid: Requested range (" + requestedStart + "-" + requestedEnd + 
+                        ") exceeds original distribution range (" + existingStart + "-" + existingEnd + ")");
+            }
+            
+            // TAKE-BACK LOGIC: Inactivate the distribution and return apps to original issuer
+            // No new distribution record needed - balance recalculation will handle it
+            
+            // Inactivate the existing distribution
+            System.out.println("=== DISTRIBUTION TAKE-BACK (INACTIVATE) - ZoneService ===");
+            System.out.println("Operation: INACTIVATE DISTRIBUTION (TAKE-BACK)");
+            System.out.println("Distribution ID: " + existingDist.getAppDistributionId());
+            System.out.println("Range: " + existingDist.getAppStartNo() + " - " + existingDist.getAppEndNo());
+            System.out.println("Returning to Original Issuer ID: " + originalIssuerId);
+            existingDist.setIsActive(0);
+            existingDist.setIssueDate(LocalDateTime.now());
+            distributionRepository.saveAndFlush(existingDist);
+            System.out.println("=====================================================");
+            
+            // Handle partial take-back: If range is reduced, create remainder for the portion not taken back
+            int oldStart = (int) existingDist.getAppStartNo();
+            int oldEnd = (int) existingDist.getAppEndNo();
+            int newStart = request.getAppStartNo();
+            int newEnd = request.getAppEndNo();
+            boolean isPartialTakeBack = (oldStart != newStart || oldEnd != newEnd);
+            
+            if (isPartialTakeBack) {
+                System.out.println("📊 Partial Take-Back: Creating remainder for untaken portion");
+                System.out.println("  Original Range: " + oldStart + " - " + oldEnd);
+                System.out.println("  Take-Back Range: " + newStart + " - " + newEnd);
+                
+                java.util.List<int[]> remainderRanges = new java.util.ArrayList<>();
+                
+                // Check for portion BEFORE the take-back range
+                if (oldStart < newStart) {
+                    int remainderStart = oldStart;
+                    int remainderEnd = newStart - 1;
+                    remainderRanges.add(new int[]{remainderStart, remainderEnd});
+                    System.out.println("  ✅ Adding remainder (before): " + remainderStart + " - " + remainderEnd);
+                }
+                
+                // Check for portion AFTER the take-back range
+                if (oldEnd > newEnd) {
+                    int remainderStart = newEnd + 1;
+                    int remainderEnd = oldEnd;
+                    remainderRanges.add(new int[]{remainderStart, remainderEnd});
+                    System.out.println("  ✅ Adding remainder (after): " + remainderStart + " - " + remainderEnd);
+                }
+                
+                // Create remainder distribution(s) for the untaken portion
+                if (!remainderRanges.isEmpty()) {
+                    for (int[] range : remainderRanges) {
+                        Distribution remainder = new Distribution();
+                        remainder.setAcademicYear(existingDist.getAcademicYear());
+                        remainder.setState(existingDist.getState());
+                        remainder.setCity(existingDist.getCity());
+                        remainder.setZone(existingDist.getZone());
+                        remainder.setDistrict(existingDist.getDistrict());
+                        remainder.setIssuedByType(existingDist.getIssuedByType());
+                        remainder.setIssuedToType(existingDist.getIssuedToType());
+                        remainder.setCreated_by(existingDist.getCreated_by());
+                        remainder.setIssueDate(java.time.LocalDateTime.now());
+                        remainder.setAmount(existingDist.getAmount());
+                        remainder.setIssued_to_emp_id(existingDist.getIssued_to_emp_id());
+                        remainder.setIssued_to_pro_id(existingDist.getIssued_to_pro_id());
+                        remainder.setAppStartNo(range[0]);
+                        remainder.setAppEndNo(range[1]);
+                        remainder.setTotalAppCount(range[1] - range[0] + 1);
+                        remainder.setIsActive(1);
+                        
+                        System.out.println("=== DISTRIBUTION SAVE (REMAINDER FROM TAKE-BACK) - ZoneService ===");
+                        System.out.println("Remainder Range: " + remainder.getAppStartNo() + " - " + remainder.getAppEndNo());
+                        System.out.println("Total Count: " + remainder.getTotalAppCount() + " apps");
+                        System.out.println("Receiver EmpId: " + remainder.getIssued_to_emp_id());
+                        distributionRepository.saveAndFlush(remainder);
+                        System.out.println("Remainder Distribution ID: " + remainder.getAppDistributionId());
+                        System.out.println("============================================================");
+                    }
+                }
+            }
+            
+            // Flush distribution changes before balance recalculation
+            distributionRepository.flush();
+            
+            // Recalculate balances for take-back
+            int acYear = existingDist.getAcademicYear().getAcdcYearId();
+            int stateId = existingDist.getState().getStateId();
+            
+            // A. Original Issuer (gets apps back) - use their original type
+            int originalIssuerTypeId = existingDist.getIssuedByType().getAppIssuedId();
+            System.out.println("DEBUG: Recalculating balance for ORIGINAL ISSUER (receiving back): " + originalIssuerId);
+            recalculateBalanceForEmployee(originalIssuerId, acYear, stateId, originalIssuerTypeId,
+                    request.getCreatedBy(), originalAmount);
+            
+            // B. Current Holder (loses apps) - use their current type
+            // currentHolderId already declared above
+            if (currentHolderId != null) {
+                int currentHolderTypeId = existingDist.getIssuedToType().getAppIssuedId();
+                System.out.println("DEBUG: Recalculating balance for CURRENT HOLDER (giving back): " + currentHolderId);
+                recalculateBalanceForEmployee(currentHolderId, acYear, stateId, currentHolderTypeId,
+                        request.getCreatedBy(), originalAmount);
+            }
+            
+            // Flush balance updates
+            balanceTrackRepository.flush();
+            
+            System.out.println("=== TAKE-BACK COMPLETED - ZoneService ===");
+            return; // Exit early - take-back is complete
+        }
+
+        // 3. NORMAL UPDATE SCENARIO (Not take-back)
+        // Resolve New Receiver (Zone Service always targets Employee column)
         // Handle multiple ZonalAccountant records for the same employee
         List<ZonalAccountant> receiverList = zonalAccountantRepository.findByEmployeeEmpId(request.getIssuedToEmpId());
         if (receiverList.isEmpty()) {
